@@ -7,19 +7,16 @@
 #include <setjmp.h>
 #include <dlfcn.h>
 
-#include "clang/Frontend/CompilerInstance.h"
-#include "clang/Frontend/TextDiagnosticPrinter.h"
-#include "clang/CodeGen/CodeGenAction.h"
-#include "clang/Frontend/CompilerInvocation.h"
-
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Verifier.h"
+#include "llvm/IRReader/IRReader.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
 #include "llvm/ExecutionEngine/Orc/ThreadSafeModule.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/Error.h"
-#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
 
@@ -32,102 +29,6 @@ static volatile sig_atomic_t signalCaught = 0;
 static void crashHandler(int sig) {
     signalCaught = sig;
     longjmp(jumpBuffer, 1);
-}
-
-static std::string compileToIR(const std::string &sourceCode,
-                                const std::string &includePath,
-                                std::string &errorMsg) {
-    SmallString<256> tempSrc;
-    if (auto ec = sys::fs::createTemporaryFile("code", "cpp", tempSrc)) {
-        errorMsg = "Error creando archivo temporal";
-        return "";
-    }
-    {
-        raw_fd_ostream out(tempSrc, false);
-        out << sourceCode;
-    }
-
-    SmallString<256> tempIR;
-    if (auto ec = sys::fs::createTemporaryFile("output", "ll", tempIR)) {
-        sys::fs::remove(tempSrc);
-        errorMsg = "Error creando archivo temporal IR";
-        return "";
-    }
-
-    auto diagOpts = clang::CreateDiagnosticOptions();
-    IntrusiveRefCntPtr<clang::DiagnosticIDs> diagIDs(new clang::DiagnosticIDs());
-    std::string diagString;
-    llvm::raw_string_ostream diagStream(diagString);
-    auto *diagPrinter = new clang::TextDiagnosticPrinter(diagStream, &*diagOpts);
-    IntrusiveRefCntPtr<clang::DiagnosticsEngine> diags(
-        new clang::DiagnosticsEngine(diagIDs, &*diagOpts, diagPrinter));
-
-    std::vector<const char *> cArgs = {
-        "-xc++",
-        "-std=c++17",
-        "-D__ANDROID__",
-        "-D__BIONIC__",
-        "-DANDROID",
-        "-D__aarch64__",
-        "-mno-outline-atomics",
-        "-nostdinc",
-        "-nostdlib",
-        "-fno-exceptions",
-        "-fno-rtti",
-        "-fno-threadsafe-statics",
-        "-w",
-        "--target=aarch64-linux-android24",
-        "-I", includePath.c_str(),
-        "-emit-llvm",
-        "-S",
-        "-o", tempIR.c_str(),
-        tempSrc.c_str()
-    };
-
-    auto invocation = std::make_unique<clang::CompilerInvocation>();
-    if (!clang::CompilerInvocation::CreateFromArgs(*invocation, cArgs, *diags)) {
-        sys::fs::remove(tempSrc);
-        sys::fs::remove(tempIR);
-        errorMsg = "Error creando CompilerInvocation: " + diagString;
-        return "";
-    }
-
-    invocation->getLangOpts()->CPlusPlus = true;
-    invocation->getLangOpts()->CPlusPlus17 = true;
-    invocation->getLangOpts()->Exceptions = 0;
-    invocation->getLangOpts()->RTTI = false;
-
-    clang::CompilerInstance CI;
-    CI.setDiagnostics(diags.get());
-    CI.setInvocation(std::move(invocation));
-
-    EmitLLVMOnlyAction action;
-    if (!CI.ExecuteAction(action)) {
-        sys::fs::remove(tempSrc);
-        sys::fs::remove(tempIR);
-        diagPrinter->Finish();
-        errorMsg = "Error compilando:\n" + diagString;
-        return "";
-    }
-
-    std::unique_ptr<Module> module = action.takeModule();
-    if (!module) {
-        sys::fs::remove(tempSrc);
-        sys::fs::remove(tempIR);
-        errorMsg = "Error generando modulo LLVM IR";
-        return "";
-    }
-
-    module->setTargetTriple("aarch64-linux-android24");
-
-    std::string irString;
-    raw_string_ostream irStream(irString);
-    irStream << *module;
-    irStream.flush();
-
-    sys::fs::remove(tempSrc);
-    sys::fs::remove(tempIR);
-    return irString;
 }
 
 static std::string jitExecute(const std::string &irCode) {
@@ -234,42 +135,24 @@ static std::string jitExecute(const std::string &irCode) {
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_mcompiladorcpp_MainActivity_compileAndRunNative(
-    JNIEnv *env, jobject, jstring jSource, jstring jIncludes, jstring jStdlib) {
+    JNIEnv *env, jobject, jstring jIRCode, jstring jIncludes, jstring jStdlib) {
 
-    const char *source = env->GetStringUTFChars(jSource, nullptr);
-    const char *includes = env->GetStringUTFChars(jIncludes, nullptr);
+    const char *ir = env->GetStringUTFChars(jIRCode, nullptr);
+    env->ReleaseStringUTFChars(jIncludes, nullptr);
     env->ReleaseStringUTFChars(jStdlib, nullptr);
 
-    std::string src(source);
-    std::string inc(includes);
-    env->ReleaseStringUTFChars(jSource, source);
-    env->ReleaseStringUTFChars(jIncludes, includes);
+    std::string irStr(ir);
+    env->ReleaseStringUTFChars(jIRCode, ir);
 
-    std::string errorMsg;
-    std::string ir = compileToIR(src, inc, errorMsg);
-    if (ir.empty()) {
-        return env->NewStringUTF(errorMsg.c_str());
-    }
-
-    return env->NewStringUTF(jitExecute(ir).c_str());
+    return env->NewStringUTF(jitExecute(irStr).c_str());
 }
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_mcompiladorcpp_MainActivity_compileOnlyNative(
     JNIEnv *env, jobject, jstring jSource, jstring jIncludes) {
 
-    const char *source = env->GetStringUTFChars(jSource, nullptr);
-    const char *includes = env->GetStringUTFChars(jIncludes, nullptr);
+    env->ReleaseStringUTFChars(jSource, nullptr);
+    env->ReleaseStringUTFChars(jIncludes, nullptr);
 
-    std::string src(source);
-    std::string inc(includes);
-    env->ReleaseStringUTFChars(jSource, source);
-    env->ReleaseStringUTFChars(jIncludes, includes);
-
-    std::string errorMsg;
-    std::string ir = compileToIR(src, inc, errorMsg);
-    if (ir.empty()) {
-        return env->NewStringUTF(errorMsg.c_str());
-    }
-    return env->NewStringUTF(ir.c_str());
+    return env->NewStringUTF("ORCJIT listo. Use compileAndRunNative con LLVM IR.");
 }
