@@ -21,6 +21,9 @@ jobs:
             /opt/az /opt/microsoft /opt/microsoft-powershell /usr/local/sqlpackage
           df -h
 
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
       - name: Setup NDK
         uses: nttld/setup-ndk@v1
         with:
@@ -108,7 +111,7 @@ jobs:
       - name: Build JNI native-lib.so
         run: |
           mkdir -p /tmp/llvm-output
-          cd jni
+          cd $GITHUB_WORKSPACE/jni
           cmake -S . -B build \
             -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
