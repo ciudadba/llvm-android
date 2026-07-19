@@ -1,0 +1,137 @@
+name: Build libLLVM for Android arm64
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/**'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android/sdk/platforms/android-34 \
+            /usr/local/lib/android/sdk/build-tools/34.0.0 /opt/hostedtoolcache \
+            /usr/local/share/boost /usr/local/graalvm /usr/local/share/chromium \
+            /usr/local/share/powershell /usr/share/swift /usr/local/julia \
+            /opt/az /opt/microsoft /opt/microsoft-powershell /usr/local/sqlpackage
+          df -h
+
+      - name: Setup NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build python3 cmake git
+
+      - name: Clone LLVM (shallow)
+        run: |
+          git clone --depth 1 --branch llvmorg-22.1.8 https://github.com/llvm/llvm-project.git llvm-project
+          df -h
+
+      - name: Configure CMake (Android aarch64)
+        run: |
+          cd llvm-project
+          cmake -S llvm -B build-android \
+            -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-24 \
+            -DANDROID_STL=none \
+            -DCMAKE_BUILD_TYPE=MinSizeRel \
+            -DCMAKE_CROSSCOMPILING=ON \
+            -DLLVM_HOST_TRIPLE=aarch64-linux-android24 \
+            -DLLVM_DEFAULT_TARGET_TRIPLE=aarch64-linux-android24 \
+            -DLLVM_TARGETS_TO_BUILD=AArch64 \
+            -DLLVM_ENABLE_PROJECTS="clang" \
+            -DLLVM_BUILD_TOOLS=OFF \
+            -DLLVM_BUILD_UTILS=ON \
+            -DLLVM_BUILD_EXAMPLES=OFF \
+            -DLLVM_BUILD_TESTS=OFF \
+            -DLLVM_BUILD_BENCHMARKS=OFF \
+            -DLLVM_BUILD_DOCS=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_DOCS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_UTILS=OFF \
+            -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DLLVM_ENABLE_ZLIB=OFF \
+            -DLLVM_ENABLE_ZSTD=OFF \
+            -DLLVM_ENABLE_XML=OFF \
+            -DLLVM_ENABLE_TERMINFO=OFF \
+            -DLLVM_ENABLE_LIBEDIT=OFF \
+            -DLLVM_ENABLE_LIBPFM=OFF \
+            -DLLVM_ENABLE_OCAMLDOC=OFF \
+            -DLLVM_ENABLE_BINDINGS=OFF \
+            -DLLVM_ENABLE_IDE=OFF \
+            -DLLVM_ENABLE_CRASH_OVERRIDES=OFF \
+            -DLLVM_USE_NEWPM=ON \
+            -DLLVM_ENABLE_PIC=ON \
+            -DLLVM_BUILD_LLVM_DYLIB=ON \
+            -DLLVM_LINK_LLVM_DYLIB=ON \
+            -DLLVM_BUILD_SHARED_LIBS=OFF \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DCLANG_ENABLE_STATIC_ANALYZER=OFF \
+            -DCLANG_ENABLE_ARCMT=OFF \
+            -DCLANG_ENABLE_OBJC_REWRITE=OFF \
+            -DCLANG_PLUGIN_SUPPORT=OFF \
+            -DLLVM_INCLUDE_CLANG_TOOLS_EXTRA=OFF \
+            -DLLVM_EXTERNAL_LIT=""
+          df -h
+
+      - name: Build libLLVM.so
+        run: |
+          cd llvm-project
+          ninja -C build-android libLLVM.so 2>&1 | tail -50
+          echo "--- Build finished ---"
+          ls -lh build-android/lib/libLLVM*.so* 2>/dev/null || echo "No .so found, checking all outputs..."
+          find build-android/lib -name "*.so*" -o -name "*.a" | head -30
+          df -h
+
+      - name: Build clang driver too
+        run: |
+          cd llvm-project
+          ninja -C build-android clang 2>&1 | tail -50
+          echo "--- Clang build finished ---"
+          ls -lh build-android/bin/clang* 2>/dev/null
+          find build-android/lib -name "libclang*.so*" | head -10
+          df -h
+
+      - name: Strip and package
+        run: |
+          cd llvm-project/build-android
+          STRIP=$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip
+          # Find and strip libLLVM
+          find . -name "libLLVM*.so*" | while read f; do
+            echo "Stripping: $f"
+            $STRIP --strip-all "$f" 2>/dev/null || true
+          done
+          # Also strip clang libs
+          find . -name "libclang*.so*" | while read f; do
+            echo "Stripping: $f"
+            $STRIP --strip-all "$f" 2>/dev/null || true
+          done
+          # Show final sizes
+          echo "=== Final libraries ==="
+          find . -name "*.so*" -exec ls -lh {} \;
+          mkdir -p /tmp/llvm-output
+          find . -name "*.so*" -exec cp {} /tmp/llvm-output/ \;
+          # Also copy clang binary if it exists
+          cp bin/clang /tmp/llvm-output/ 2>/dev/null || true
+          ls -lh /tmp/llvm-output/
+          du -sh /tmp/llvm-output/
+
+      - name: Upload libLLVM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libLLVM-android-arm64
+          path: /tmp/llvm-output/*
+          retention-days: 90
