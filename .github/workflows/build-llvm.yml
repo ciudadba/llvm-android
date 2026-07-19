@@ -105,6 +105,23 @@ jobs:
           find build-android/lib -name "libclang*.so*" | head -10
           df -h
 
+      - name: Build JNI native-lib.so
+        run: |
+          mkdir -p /tmp/llvm-output
+          cd jni
+          cmake -S . -B build \
+            -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-24 \
+            -DANDROID_STL=c++_static \
+            -DLIB_DIR=$(pwd)/../llvm-project/build-android/lib
+          ninja -C build
+          ls -lh build/libnative-lib.so
+          $ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip --strip-all build/libnative-lib.so
+          cp build/libnative-lib.so /tmp/llvm-output/
+          df -h
+
       - name: Strip and package
         run: |
           cd llvm-project/build-android
