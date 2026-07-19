@@ -16,6 +16,7 @@ target_include_directories(native PRIVATE
     "${LLVM_BUILD}/llvm/include"
     "${CLANG_SRC}/include"
     "${LLVM_BUILD}/clang/include"
+    "${LLVM_BUILD}/tools/clang/include"
 )
 
 target_compile_options(native PRIVATE -frtti -fexceptions)
