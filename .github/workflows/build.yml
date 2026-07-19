@@ -54,9 +54,10 @@ jobs:
           sudo apt-get install -y ninja-build python3 cmake git
 
       - name: Clone LLVM
-        if: steps.cache-llvm.outputs.cache-hit != 'true'
         run: |
-          git clone --depth 1 --branch llvmorg-22.1.8 https://github.com/llvm/llvm-project.git llvm-project
+          if [ ! -d "llvm-project/llvm" ]; then
+            git clone --depth 1 --branch llvmorg-22.1.8 https://github.com/llvm/llvm-project.git llvm-project
+          fi
           df -h
 
       - name: Compilar LLVM (Android arm64)
