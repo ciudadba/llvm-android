@@ -44,10 +44,10 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
             -DANDROID_ABI=arm64-v8a \
             -DANDROID_PLATFORM=android-24 \
-            -DANDROID_STL=none \
+            -DANDROID_STL=c++_static \
             -DCMAKE_BUILD_TYPE=MinSizeRel \
             -DCMAKE_CROSSCOMPILING=ON \
-            -DLLVM_HOST_TRIPLE=aarch64-linux-android24 \
+            -DLLVM_HOST_TRIPLE=x86_64-unknown-linux-gnu \
             -DLLVM_DEFAULT_TARGET_TRIPLE=aarch64-linux-android24 \
             -DLLVM_TARGETS_TO_BUILD=AArch64 \
             -DLLVM_ENABLE_PROJECTS="clang" \
