@@ -1,24 +1,26 @@
 #include <jni.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <signal.h>
+#include <pthread.h>
+
+#include <llvm/ExecutionEngine/Orc/LLJIT.h>
+#include <clang/Frontend/CompilerInstance.h>
+#include <clang/CodeGen/CodeGenAction.h>
+
+#include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/Module.h>
+#include <llvm/IRReader/IRReader.h>
+#include <llvm/Support/TargetSelect.h>
+#include <llvm/Support/Error.h>
+#include <llvm/Support/MemoryBuffer.h>
+#include <llvm/Support/raw_ostream.h>
+#include <llvm/Target/TargetMachine.h>
+#include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
+
 #include <string>
 #include <cstring>
-#include <cstdlib>
-#include <unistd.h>
-#include <signal.h>
 #include <setjmp.h>
-#include <dlfcn.h>
-
-#include "llvm/IR/LLVMContext.h"
-#include "llvm/IR/Module.h"
-#include "llvm/IR/Verifier.h"
-#include "llvm/IRReader/IRReader.h"
-#include "llvm/ExecutionEngine/Orc/LLJIT.h"
-#include "llvm/ExecutionEngine/Orc/ThreadSafeModule.h"
-#include "llvm/Support/TargetSelect.h"
-#include "llvm/Support/Error.h"
-#include "llvm/Support/MemoryBuffer.h"
-#include "llvm/Support/SourceMgr.h"
-#include "llvm/Support/raw_ostream.h"
-#include "llvm/Target/TargetMachine.h"
 
 using namespace llvm;
 using namespace llvm::orc;
@@ -31,103 +33,142 @@ static void crashHandler(int sig) {
     longjmp(jumpBuffer, 1);
 }
 
-static std::string jitExecute(const std::string &irCode) {
+struct PipeCapture {
+    int old_stdout, old_stderr, pfd[2];
+    void start() {
+        fflush(stdout); fflush(stderr);
+        old_stdout = dup(STDOUT_FILENO);
+        old_stderr = dup(STDERR_FILENO);
+        pipe(pfd);
+        dup2(pfd[1], STDOUT_FILENO);
+        dup2(pfd[1], STDERR_FILENO);
+        close(pfd[1]);
+    }
+    std::string stop() {
+        fflush(stdout); fflush(stderr);
+        dup2(old_stdout, STDOUT_FILENO);
+        dup2(old_stderr, STDERR_FILENO);
+        close(old_stdout); close(old_stderr);
+        std::string out;
+        char buf[4096]; ssize_t n;
+        while ((n = read(pfd[0], buf, sizeof(buf)-1)) > 0) { buf[n]='\0'; out.append(buf,n); }
+        close(pfd[0]);
+        return out;
+    }
+};
+
+static std::string compileToIR(const std::string &source, const std::string &includes, std::string &err) {
+    auto diagOpts = clang::CreateDiagnosticOptions();
+    IntrusiveRefCntPtr<clang::DiagnosticIDs> diagIDs(new clang::DiagnosticIDs());
+    std::string diagStr;
+    llvm::raw_string_ostream diagOS(diagStr);
+    auto *printer = new clang::TextDiagnosticPrinter(diagOS, &*diagOpts);
+    IntrusiveRefCntPtr<clang::DiagnosticsEngine> diags(
+        new clang::DiagnosticsEngine(diagIDs, &*diagOpts, printer));
+
+    std::vector<const char*> args = {
+        "-xc++", "-std=c++17",
+        "-D__ANDROID__", "-D__BIONIC__", "-DANDROID", "-D__aarch64__",
+        "-mno-outline-atomics", "-nostdinc", "-nostdlib",
+        "-fno-exceptions", "-fno-rtti", "-fno-threadsafe-statics", "-w",
+        "--target=aarch64-linux-android24",
+        "-I", includes.c_str()
+    };
+
+    auto inv = std::make_unique<clang::CompilerInvocation>();
+    if (!clang::CompilerInvocation::CreateFromArgs(*inv, args, *diags)) {
+        err = "CompilerInvocation failed: " + diagStr;
+        return "";
+    }
+    inv->getLangOpts()->CPlusPlus = true;
+    inv->getLangOpts()->CPlusPlus17 = true;
+    inv->getLangOpts()->Exceptions = 0;
+    inv->getLangOpts()->RTTI = false;
+
+    clang::CompilerInstance CI;
+    CI.setDiagnostics(diags.get());
+    CI.setInvocation(std::move(inv));
+    if (!CI.hasFileManager()) CI.createFileManager();
+    CI.createSourceManager(CI.getFileManager());
+
+    EmitLLVMOnlyAction action;
+    if (!CI.ExecuteAction(action)) {
+        printer->Finish();
+        err = "Clang error:\n" + diagStr;
+        return "";
+    }
+
+    std::unique_ptr<Module> mod = action.takeModule();
+    if (!mod) { err = "No LLVM module generated"; return ""; }
+
+    mod->setTargetTriple("aarch64-linux-android24");
+    std::string ir;
+    llvm::raw_string_ostream os(ir);
+    os << *mod;
+    return ir;
+}
+
+static std::string jitRun(const std::string &irCode) {
     InitializeNativeTarget();
     InitializeNativeAsmParser();
 
-    auto context = std::make_unique<LLVMContext>();
-
+    auto ctx = std::make_unique<LLVMContext>();
     auto jit = LLJITBuilder().create();
-    if (!jit) {
-        return "Error creando JIT: " + toString(jit.takeError());
+    if (!jit) return "JIT error: " + toString(jit.takeError());
+
+    (*jit)->getPlatformJITDylib().addGenerator(
+        cantFail(orc::DynamicLibrarySearchGenerator::GetForCurrentProcess()));
+
+    auto buf = MemoryBuffer::getMemBuffer(irCode);
+    SMDiagnostic smD;
+    auto mod = parseIRFile(buf->getBufferIdentifier(), smD, *ctx);
+    if (!mod) {
+        std::string e;
+        llvm::raw_string_ostream es(e);
+        smD.print("jit", es);
+        return e;
     }
+    mod->setTargetTriple("aarch64-linux-android24");
 
-    auto &JD = (*jit)->getMainJITDylib();
-    auto Gen = DynamicLibrarySearchGenerator::GetForProcess(
-        (*jit)->getDataLayout().getGlobalPrefix());
-    if (!Gen) {
-        return "Error creando symbol resolver: " + toString(Gen.takeError());
-    }
-    JD.add(std::move(*Gen));
+    if (auto err = (*jit)->addIRModule(ThreadSafeModule(std::move(mod), std::move(ctx))))
+        return "Module error: " + toString(std::move(err));
 
-    auto memBuf = MemoryBuffer::getMemBuffer(irCode);
-    SMDiagnostic smDiag;
-    auto module = parseIRFile(memBuf->getBufferIdentifier(), smDiag, *context);
-    if (!module) {
-        std::string errMsg;
-        raw_string_ostream errStream(errMsg);
-        smDiag.print("jit", errStream);
-        return errMsg;
-    }
+    auto addr = (*jit)->lookup("main");
+    if (!addr) return "main not found: " + toString(addr.takeError());
 
-    module->setTargetTriple("aarch64-linux-android24");
+    typedef int (*Fn)();
+    Fn mainFn = reinterpret_cast<Fn>(addr->getAddress());
 
-    auto tsm = ThreadSafeModule(std::move(module), std::move(context));
-    if (auto err = (*jit)->addIRModule(std::move(tsm))) {
-        return "Error agregando modulo: " + toString(std::move(err));
-    }
+    struct sigaction sa, old_segv, old_fpe, old_ill, old_abrt;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = crashHandler;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, &old_segv);
+    sigaction(SIGFPE, &sa, &old_fpe);
+    sigaction(SIGILL, &sa, &old_ill);
+    sigaction(SIGABRT, &sa, &old_abrt);
 
-    auto mainAddr = (*jit)->lookup("main");
-    if (!mainAddr) {
-        return "Error: 'main' no encontrada\n" + toString(mainAddr.takeError());
-    }
-
-    typedef int (*MainFunc)();
-    MainFunc mainFunc = reinterpret_cast<MainFunc>(mainAddr->getAddress());
-
-    struct sigaction sa_new, sa_old_segv, sa_old_fpe, sa_old_ill, sa_old_abrt;
-    memset(&sa_new, 0, sizeof(sa_new));
-    sa_new.sa_handler = crashHandler;
-    sigemptyset(&sa_new.sa_mask);
-    sigaction(SIGSEGV, &sa_new, &sa_old_segv);
-    sigaction(SIGFPE, &sa_new, &sa_old_fpe);
-    sigaction(SIGILL, &sa_new, &sa_old_ill);
-    sigaction(SIGABRT, &sa_new, &sa_old_abrt);
-
-    int old_stdout = dup(STDOUT_FILENO);
-    int old_stderr = dup(STDERR_FILENO);
-    int pipefd[2];
-    pipe(pipefd);
-    dup2(pipefd[1], STDOUT_FILENO);
-    dup2(pipefd[1], STDERR_FILENO);
-    close(pipefd[1]);
+    PipeCapture cap;
+    cap.start();
 
     int exitCode = 0;
     std::string output;
     if (setjmp(jumpBuffer) == 0) {
-        exitCode = mainFunc();
+        exitCode = mainFn();
     } else {
-        dup2(old_stdout, STDOUT_FILENO);
-        dup2(old_stderr, STDERR_FILENO);
-        close(old_stdout);
-        close(old_stderr);
-        close(pipefd[0]);
-        sigaction(SIGSEGV, &sa_old_segv, nullptr);
-        sigaction(SIGFPE, &sa_old_fpe, nullptr);
-        sigaction(SIGILL, &sa_old_ill, nullptr);
-        sigaction(SIGABRT, &sa_old_abrt, nullptr);
-        return "Error de ejecucion: signal " + std::to_string(signalCaught);
+        output = cap.stop();
+        sigaction(SIGSEGV, &old_segv, nullptr);
+        sigaction(SIGFPE, &old_fpe, nullptr);
+        sigaction(SIGILL, &old_ill, nullptr);
+        sigaction(SIGABRT, &old_abrt, nullptr);
+        return output + "\nCrash: signal " + std::to_string(signalCaught);
     }
 
-    fflush(stdout);
-    fflush(stderr);
-    dup2(old_stdout, STDOUT_FILENO);
-    dup2(old_stderr, STDERR_FILENO);
-    close(old_stdout);
-    close(old_stderr);
-
-    char buf[4096];
-    ssize_t n;
-    while ((n = read(pipefd[0], buf, sizeof(buf) - 1)) > 0) {
-        buf[n] = '\0';
-        output.append(buf, n);
-    }
-    close(pipefd[0]);
-
-    sigaction(SIGSEGV, &sa_old_segv, nullptr);
-    sigaction(SIGFPE, &sa_old_fpe, nullptr);
-    sigaction(SIGILL, &sa_old_ill, nullptr);
-    sigaction(SIGABRT, &sa_old_abrt, nullptr);
+    output = cap.stop();
+    sigaction(SIGSEGV, &old_segv, nullptr);
+    sigaction(SIGFPE, &old_fpe, nullptr);
+    sigaction(SIGILL, &old_ill, nullptr);
+    sigaction(SIGABRT, &old_abrt, nullptr);
 
     output += "\n[Exit: " + std::to_string(exitCode) + "]";
     return output;
@@ -135,24 +176,31 @@ static std::string jitExecute(const std::string &irCode) {
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_mcompiladorcpp_MainActivity_compileAndRunNative(
-    JNIEnv *env, jobject, jstring jIRCode, jstring jIncludes, jstring jStdlib) {
+    JNIEnv *env, jobject, jstring jSrc, jstring jInc, jstring jStd) {
+    const char *src = env->GetStringUTFChars(jSrc, nullptr);
+    const char *inc = env->GetStringUTFChars(jInc, nullptr);
+    env->ReleaseStringUTFChars(jStd, nullptr);
+    std::string source(src), includes(inc);
+    env->ReleaseStringUTFChars(jSrc, src);
+    env->ReleaseStringUTFChars(jInc, inc);
 
-    const char *ir = env->GetStringUTFChars(jIRCode, nullptr);
-    env->ReleaseStringUTFChars(jIncludes, nullptr);
-    env->ReleaseStringUTFChars(jStdlib, nullptr);
-
-    std::string irStr(ir);
-    env->ReleaseStringUTFChars(jIRCode, ir);
-
-    return env->NewStringUTF(jitExecute(irStr).c_str());
+    std::string err;
+    std::string ir = compileToIR(source, includes, err);
+    if (ir.empty()) return env->NewStringUTF(err.c_str());
+    return env->NewStringUTF(jitRun(ir).c_str());
 }
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_mcompiladorcpp_MainActivity_compileOnlyNative(
-    JNIEnv *env, jobject, jstring jSource, jstring jIncludes) {
+    JNIEnv *env, jobject, jstring jSrc, jstring jInc) {
+    const char *src = env->GetStringUTFChars(jSrc, nullptr);
+    const char *inc = env->GetStringUTFChars(jInc, nullptr);
+    std::string source(src), includes(inc);
+    env->ReleaseStringUTFChars(jSrc, src);
+    env->ReleaseStringUTFChars(jInc, inc);
 
-    env->ReleaseStringUTFChars(jSource, nullptr);
-    env->ReleaseStringUTFChars(jIncludes, nullptr);
-
-    return env->NewStringUTF("ORCJIT listo. Use compileAndRunNative con LLVM IR.");
+    std::string err;
+    std::string ir = compileToIR(source, includes, err);
+    if (ir.empty()) return env->NewStringUTF(err.c_str());
+    return env->NewStringUTF(ir.c_str());
 }

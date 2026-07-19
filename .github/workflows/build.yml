@@ -48,7 +48,6 @@ jobs:
           local-cache: true
 
       - name: Instalar dependencias
-        if: steps.cache-llvm.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y ninja-build python3 cmake git
@@ -56,8 +55,17 @@ jobs:
       - name: Clone LLVM
         run: |
           if [ ! -d "llvm-project/llvm" ]; then
-            git clone --depth 1 --branch llvmorg-22.1.8 https://github.com/llvm/llvm-project.git llvm-project
+            if [ -d "llvm-project" ]; then
+              # Cache restored build-android dir but no source - clone to temp and merge
+              git clone --depth 1 --branch llvmorg-22.1.8 https://github.com/llvm/llvm-project.git llvm-project-src
+              cp -a llvm-project-src/. llvm-project/
+              rm -rf llvm-project-src
+            else
+              git clone --depth 1 --branch llvmorg-22.1.8 https://github.com/llvm/llvm-project.git llvm-project
+            fi
           fi
+          ls llvm-project/clang/include/clang/Frontend/CompilerInstance.h
+          ls llvm-project/llvm/include/llvm/ExecutionEngine/Orc/LLJIT.h
           df -h
 
       - name: Compilar LLVM (Android arm64)
