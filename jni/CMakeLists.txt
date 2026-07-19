@@ -12,6 +12,7 @@ add_library(native SHARED native-lib.cpp)
 
 target_include_directories(native PRIVATE
     "${LLVM_SRC}/include"
+    "${LLVM_BUILD}/include"
     "${LLVM_BUILD}/llvm/include"
     "${CLANG_SRC}/include"
     "${LLVM_BUILD}/clang/include"
