@@ -6,6 +6,8 @@
 
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
 #include <clang/Frontend/CompilerInstance.h>
+#include <clang/Frontend/CompilerInvocation.h>
+#include <clang/Frontend/TextDiagnosticPrinter.h>
 #include <clang/CodeGen/CodeGenAction.h>
 
 #include <llvm/IR/LLVMContext.h>
@@ -58,13 +60,13 @@ struct PipeCapture {
 };
 
 static std::string compileToIR(const std::string &source, const std::string &includes, std::string &err) {
-    auto diagOpts = clang::CreateDiagnosticOptions();
+    auto diagOpts = std::make_shared<clang::DiagnosticOptions>();
     IntrusiveRefCntPtr<clang::DiagnosticIDs> diagIDs(new clang::DiagnosticIDs());
     std::string diagStr;
     llvm::raw_string_ostream diagOS(diagStr);
-    auto *printer = new clang::TextDiagnosticPrinter(diagOS, &*diagOpts);
+    auto *printer = new clang::TextDiagnosticPrinter(diagOS, *diagOpts);
     IntrusiveRefCntPtr<clang::DiagnosticsEngine> diags(
-        new clang::DiagnosticsEngine(diagIDs, &*diagOpts, printer));
+        new clang::DiagnosticsEngine(diagIDs, *diagOpts, printer));
 
     std::vector<const char*> args = {
         "-xc++", "-std=c++17",
@@ -75,25 +77,21 @@ static std::string compileToIR(const std::string &source, const std::string &inc
         "-I", includes.c_str()
     };
 
-    auto inv = std::make_unique<clang::CompilerInvocation>();
+    auto inv = std::make_shared<clang::CompilerInvocation>();
     if (!clang::CompilerInvocation::CreateFromArgs(*inv, args, *diags)) {
         err = "CompilerInvocation failed: " + diagStr;
         return "";
     }
-    inv->getLangOpts()->CPlusPlus = true;
-    inv->getLangOpts()->CPlusPlus17 = true;
-    inv->getLangOpts()->Exceptions = 0;
-    inv->getLangOpts()->RTTI = false;
+    inv->getLangOpts().CPlusPlus = true;
+    inv->getLangOpts().CPlusPlus17 = true;
+    inv->getLangOpts().Exceptions = 0;
+    inv->getLangOpts().RTTI = false;
 
-    clang::CompilerInstance CI;
-    CI.setDiagnostics(diags.get());
-    CI.setInvocation(std::move(inv));
-    if (!CI.hasFileManager()) CI.createFileManager();
-    CI.createSourceManager(CI.getFileManager());
+    clang::CompilerInstance CI(inv);
+    CI.setDiagnostics(diags);
 
-    EmitLLVMOnlyAction action;
+    clang::EmitLLVMOnlyAction action;
     if (!CI.ExecuteAction(action)) {
-        printer->Finish();
         err = "Clang error:\n" + diagStr;
         return "";
     }
@@ -101,7 +99,7 @@ static std::string compileToIR(const std::string &source, const std::string &inc
     std::unique_ptr<Module> mod = action.takeModule();
     if (!mod) { err = "No LLVM module generated"; return ""; }
 
-    mod->setTargetTriple("aarch64-linux-android24");
+    mod->setTargetTriple(llvm::Triple("aarch64-linux-android24"));
     std::string ir;
     llvm::raw_string_ostream os(ir);
     os << *mod;
@@ -110,14 +108,13 @@ static std::string compileToIR(const std::string &source, const std::string &inc
 
 static std::string jitRun(const std::string &irCode) {
     InitializeNativeTarget();
-    InitializeNativeAsmParser();
 
     auto ctx = std::make_unique<LLVMContext>();
     auto jit = LLJITBuilder().create();
     if (!jit) return "JIT error: " + toString(jit.takeError());
 
-    (*jit)->getPlatformJITDylib().addGenerator(
-        cantFail(orc::DynamicLibrarySearchGenerator::GetForCurrentProcess()));
+    (*jit)->getPlatformJITDylib()->addGenerator(
+        cantFail(orc::DynamicLibrarySearchGenerator::GetForCurrentProcess('\0')));
 
     auto buf = MemoryBuffer::getMemBuffer(irCode);
     SMDiagnostic smD;
@@ -128,7 +125,7 @@ static std::string jitRun(const std::string &irCode) {
         smD.print("jit", es);
         return e;
     }
-    mod->setTargetTriple("aarch64-linux-android24");
+    mod->setTargetTriple(llvm::Triple("aarch64-linux-android24"));
 
     if (auto err = (*jit)->addIRModule(ThreadSafeModule(std::move(mod), std::move(ctx))))
         return "Module error: " + toString(std::move(err));
@@ -137,7 +134,7 @@ static std::string jitRun(const std::string &irCode) {
     if (!addr) return "main not found: " + toString(addr.takeError());
 
     typedef int (*Fn)();
-    Fn mainFn = reinterpret_cast<Fn>(addr->getAddress());
+    Fn mainFn = addr->toPtr<Fn>();
 
     struct sigaction sa, old_segv, old_fpe, old_ill, old_abrt;
     memset(&sa, 0, sizeof(sa));
